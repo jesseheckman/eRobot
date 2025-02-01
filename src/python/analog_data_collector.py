@@ -2,6 +2,7 @@ import serial
 import serial.tools.list_ports
 import pandas as pd
 import time
+import matplotlib.pyplot as plt
 
 class ArduinoDataCollector:
     """
@@ -19,9 +20,20 @@ class ArduinoDataCollector:
         - timeout (int): Timeout for the serial connection in seconds (default: 1).
         - buffer_size (int): Maximum size of the buffer before flushing to DataFrame.
         """
-        self.port = port
+        if port is None:
+            ports = self.list_available_ports()
+            usbmodem_ports = [p for p in ports if 'usbmodem' in p]
+            if usbmodem_ports:
+                self.port = usbmodem_ports[0]
+                print(f"No port specified. Using first 'usbmodem' port: {self.port}")
+            else:
+                raise ValueError("No 'usbmodem' ports found. Please specify a valid port.")
+        else:
+            self.port = port
+
         self.baudrate = baudrate
         self.timeout = timeout
+        self.handshake_timeout = 100
         self.buffer_size = buffer_size
         self.connection = None
         self.data = None  # DataFrame will be initialized after receiving format message
@@ -61,12 +73,9 @@ class ArduinoDataCollector:
             print(f"Failed to connect: {e}")
             raise
 
-    def await_handshake(self, timeout=10):
+    def await_handshake(self):
         """
         Wait for a handshake signal ('INIT-COM') from the Arduino.
-
-        Parameters:
-        - timeout (int): Time in seconds to wait for the handshake before timing out.
 
         Raises:
         - TimeoutError: If the handshake is not received within the timeout period.
@@ -80,7 +89,7 @@ class ArduinoDataCollector:
                     self.connection.write(b"READY\n")  # Send acknowledgment
                     print("Sent READY signal to Arduino")
                     return
-            if time.time() - start_time > timeout:
+            if time.time() - start_time > self.handshake_timeout:
                 print("Handshake timed out")
                 raise TimeoutError("Failed to receive handshake from Arduino")
 
@@ -88,9 +97,6 @@ class ArduinoDataCollector:
         """
         Process the format message ('Format: ...') from the Arduino to define
         the data structure for the DataFrame.
-
-        This method listens for a message starting with 'Format:' and uses it
-        to initialize the columns of the DataFrame.
         """
         while True:
             if self.connection.in_waiting > 0:
@@ -101,7 +107,7 @@ class ArduinoDataCollector:
                     self.data = pd.DataFrame(columns=self.columns)
                     return
 
-    def read_sensor_data(self, duration=None):
+    def read_sensor_data(self, duration=None, visualize=True):
         """
         Read sensor data from the Arduino. The recording stops after the given
         duration or when a 'STOP-COM' signal is received.
@@ -109,9 +115,22 @@ class ArduinoDataCollector:
         Parameters:
         - duration (int): Duration in seconds to record data (optional). 
                           If not provided, recording stops on 'STOP-COM'.
+        - visualize (bool): Whether to display a live plot of the data.
         """
+
+        print(duration)
         start_time = time.time()
+        sample_count = 0
         try:
+            if visualize:
+                plt.ion()
+                fig, ax = plt.subplots()
+                lines = {}
+                for col in self.columns[1:]:  # Skip the first column (Ts)
+                    lines[col], = ax.plot([], [], label=col)
+                ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))  # Legend on the right
+                recent_data = {col: [] for col in self.columns[1:]}
+
             while True:
                 # Stop if the fixed duration has elapsed
                 if duration and (time.time() - start_time) >= duration:
@@ -133,6 +152,23 @@ class ArduinoDataCollector:
                         row = {col: float(value) for col, value in zip(self.columns, parts)}
                         self.buffer.append(row)
 
+                        # Visualize every 50th sample
+                        sample_count += 1
+                        if visualize and sample_count % 50 == 0:
+                            elapsed_time = (sample_count / 200)  # Convert to seconds
+                            for col in self.columns[1:]:  # Skip the first column (Ts)
+                                recent_data[col].append(row[col])
+                                if len(recent_data[col]) > 50:  # Limit the display to the last 50 samples
+                                    recent_data[col].pop(0)
+                            for col, line in lines.items():
+                                line.set_xdata([elapsed_time - (len(recent_data[col]) - i) * 0.25 for i in range(len(recent_data[col]))])
+                                line.set_ydata(recent_data[col])
+                            ax.relim()
+                            ax.autoscale_view()
+                            ax.set_xlabel("Time (s)")
+                            plt.draw()
+                            plt.pause(0.01)
+
                         # Check if the buffer exceeds the size limit
                         if len(self.buffer) >= self.buffer_size:
                             self.flush_buffer_to_dataframe()
@@ -142,6 +178,9 @@ class ArduinoDataCollector:
         finally:
             # Ensure data in buffer is saved
             self.flush_buffer_to_dataframe()
+            if visualize:
+                plt.ioff()
+                plt.show()
             self.close_connection()
 
     def flush_buffer_to_dataframe(self):
@@ -188,15 +227,14 @@ if __name__ == "__main__":
     collector = ArduinoDataCollector()
     collector.print_available_ports()
     
-    # Update this port based on your system
-    collector = ArduinoDataCollector(port="/dev/cu.usbmodemF412FA762D9C2", buffer_size=100)
+    # Automatically selects the first 'usbmodem' port if not specified
     collector.connect()
     collector.await_handshake()
     collector.process_format_message()
 
     # Use a fixed duration or wait for STOP-COM
     try:
-        collector.read_sensor_data(duration=30)  # Record for 30 seconds
+        collector.read_sensor_data(duration=60, visualize=True)  # Record for 60 seconds with live visualization
     except Exception as e:
         print(f"Error during data collection: {e}")
 
